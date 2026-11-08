@@ -84,7 +84,7 @@ Diagram relasi database tersedia dalam resolusi tinggi di:
 📁 **`image/erd.png`**
 
 Dump database yang telah dikompresi tersedia di:
-📁 **`dump/netcom_dump.sql.gz`**
+📁 **`dump/netcom_ecommerce.sql.gz`**
 
 ---
 
@@ -92,19 +92,26 @@ Dump database yang telah dikompresi tersedia di:
 
 > **Pertanyaan:** *Apa yang Anda akan lakukan apabila data kian membesar ratusan kali lipat dan user yang terus bertambah hingga aplikasi diakses oleh ratusan orang dalam satu waktu dalam meningkatkan/menjaga performa aplikasi?*
 
-Berikut adalah arsitektur strategi skala besar (*High Scalability Architecture*) yang akan diterapkan:
+### 1. Root Cause & Problem Analysis
+Pada volume data puluhan juta baris dengan ratusan user konkuren (~50–200 QPS), bottleneck terbesar **bukan di CPU web server**, melainkan pada **I/O Database akibat query agregasi analitik**:
+- Menjalankan `SUM()`, `COUNT()`, dan `GROUP BY DATE` berulang-ulang di tabel transaksi besar akan membebani IOPS database dan menyebabkan *table lock*.
+- Mayoritas user di dashboard analitik mengakses rentang data periode yang sama secara bersamaan (misal: memantau laporan bulan tertentu).
 
-### 1. Database Tier: Read/Write Splitting & Partitioning
-- **Pemisahan Read/Write (Replication):** Membagi beban transaksi. Operasi tulis (transaksi baru, CRUD) diarahkan ke *Primary/Master Database*, sedangkan beban pembacaan analitik (Dashboard, Grafik Revenue) diarahkan ke sekumpulan *Read Replicas* menggunakan konfigurasi bawaan Laravel (`read` & `write` connection).
-- **Table Partitioning:** Tabel transaksi historis seperti `orders` dan `order_payments` dipartisi berdasarkan tahun transaksi (`PARTITION BY RANGE (YEAR(order_purchase_timestamp))`). Hal ini mencegah full table scan saat query hanya membutuhkan data periode tertentu.
-- **Dedicated OLAP / Data Warehouse:** Jika data mencapai puluhan juta baris, beban agregasi analitik dialihkan dari MySQL (OLTP) ke database kolumnar seperti **ClickHouse** atau **Google BigQuery** melalui proses Change Data Capture (CDC) Debezium/Kafka.
+---
 
-### 2. Multi-Tier Caching Strategy
-- **Application Caching (Redis):** Data agregasi revenue historis (bulan/tahun yang sudah berlalu) bersifat *immutable* (tidak berubah). Hasil agregasi di-cache di Redis dengan TTL panjang.
-- **Event-Driven Cache Invalidation:** Menggunakan Laravel Cache Tags. Jika ada pembaruan transaksi pada bulan berjalan, sistem secara otomatis hanya menghapus cache untuk bulan tersebut.
-- **Edge Caching (CDN):** Menempatkan Cloudflare CDN di depan API untuk melakukan caching HTTP (`Cache-Control: public, max-age=300`) pada endpoint agregasi publik.
+### 2. Strategi Solusi Pragmatis (Pragmatic Engineering)
 
-### 3. Application Tier & Concurrency Handling
-- **Stateless Application & Auto-Scaling:** Memastikan seluruh instance backend Laravel bersifat *stateless* (session dan cache berada di Redis, media file di AWS S3) sehingga backend dapat di-scale horizontal di Kubernetes / AWS ECS di balik Application Load Balancer (ALB).
-- **Database Connection Pooling:** Mengimplementasikan **ProxySQL** di antara server aplikasi dan database untuk mencegah kehabisan koneksi (*connection exhaustion*) saat ratusan user mengakses secara bersamaan.
-- **Asynchronous Queue Processing:** Proses berat seperti import batch, generate laporan PDF/Excel, atau kalkulasi anomali periodik dialihkan ke background worker menggunakan **Laravel Horizon (Redis Queue)**.
+#### A. Pre-Aggregated Summary Table (Data Rollup) — *Dampak Paling Masif*
+Data transaksi lampau (misal: data tahun 2017) bersifat **historis dan tidak pernah berubah (*immutable*)**. Menghitung ulang jutaan baris setiap kali dashboard dibuka adalah inefisiensi arsitektur.
+- **Solusi:** Buat tabel rekapitulasi harian `daily_revenue_summaries`.
+- Jalankan scheduled job (cron) di latar belakang setiap malam untuk mengagregasi data transaksi hari berjalan.
+- Query dashboard hanya perlu membaca ~30 baris dari tabel rekap (bukan memindai jutaan baris transaksi mentah), memangkas waktu respons dari **~5–8 detik menjadi <5 milidetik**.
+
+#### B. Caching Berjenjang di Service Layer (Redis)
+- Hasil kalkulasi endpoint analitik di-cache di Redis menggunakan pola `Cache::remember('revenue:2017:11', 3600, ...)`.
+- Ketika 100 user membuka dashboard secara bersamaan, **hanya request pertama yang menyentuh database**, sementara 99 user lainnya langsung dilayani dari memory RAM Redis dengan latensi mikrodetik.
+- Caching pada data hari ini menggunakan TTL pendek (5–15 menit) atau *event-driven cache invalidation* saat ada transaksi baru.
+
+#### C. Pemisahan Beban Service & Read-Replicas
+- **Pemisahan Baca & Tulis (Read-Write Splitting):** Menggunakan konfigurasi native Laravel (`read` & `write` connection di `config/database.php`). Operasi tulis transaksi baru diarahkan ke *Primary Database*, sedangkan query dashboard dan pelaporan diarahkan ke *Read Replica*, sehingga analitik tidak pernah mengganggu antrean checkout/order.
+- **Asynchronous Worker:** Proses berat seperti import massal dataset, ekspor laporan ke Excel/PDF, atau kalkulasi anomali periodik dialihkan sepenuhnya ke background queue worker (Laravel Queue), menjaga thread HTTP request tetap ringan dan responsif.
